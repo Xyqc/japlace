@@ -1,0 +1,16 @@
+[package]
+name = "poke_engine"
+edition = "2021"
+version = "0.0.48"
+
+[lib]
+name = "poke_engine"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
+poke-engine = { path = "../" }
+
+[features]
+default = ["poke-engine/gen4"]

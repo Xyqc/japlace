@@ -1,0 +1,7 @@
+**/dist
+/target
+.idea/
+.vscode
+*.so
+**__pycache**
+poke-engine-py/docs/build/

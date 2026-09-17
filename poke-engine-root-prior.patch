@@ -1,0 +1,841 @@
+diff -ruN a/poke-engine-py/python/poke_engine/__init__.py b/poke-engine-py/python/poke_engine/__init__.py
+--- a/poke-engine-py/python/poke_engine/__init__.py	2026-09-17 04:42:04.904063185 +0000
++++ b/poke-engine-py/python/poke_engine/__init__.py	2026-09-17 04:42:04.909664378 +0000
+@@ -146,7 +146,14 @@
+ 
+ 
+ def monte_carlo_tree_search(
+-    state: State, duration_ms: int = 1000, iterations: int = 0, threads: int = 1
++    state: State,
++    duration_ms: int = 1000,
++    iterations: int = 0,
++    threads: int = 1,
++    side_one_prior: dict[str, float] | None = None,
++    side_two_prior: dict[str, float] | None = None,
++    root_c_puct: float = 0.0,
++    root_regret_matching: bool = False,
+ ) -> MctsResult:
+     """
+     Perform monte-carlo-tree-search on the given state and for the given duration
+@@ -159,10 +166,42 @@
+     :type iterations: int
+     :param threads: number of threads to use for the search
+     :type threads: int
++    :param side_one_prior: optional learned prior over side one's legal actions this turn,
++        keyed by the same move_choice strings MctsSideResult.move_choice returns (e.g.
++        "tackle", "tackle-tera", "switch pikachu"). Missing keys fall back to a uniform
++        prior; omitting this argument entirely (the default) reproduces the exact search
++        behaviour from before this parameter existed.
++    :type side_one_prior: dict[str, float] | None
++    :param side_two_prior: same idea, for side two (the opponent). THE CALLER IS RESPONSIBLE
++        for building this only from information actually revealed to the real opponent --
++        the engine cannot verify that and will use whatever it's given. Building this from
++        the specific hidden world this `state` happens to have sampled reintroduces the
++        exact information leak keeping this parameter separate from side_one_prior was
++        meant to avoid.
++    :type side_two_prior: dict[str, float] | None
++    :param root_c_puct: exploration constant for the root-level prior term, applied to
++        whichever side(s) a prior was supplied for. 0.0 (default) disables the prior path
++        entirely and falls back to plain UCB1, byte-identical to pre-Phase-1 behaviour.
++    :type root_c_puct: float
++    :param root_regret_matching: if True (and root_c_puct > 0), sample the root move each
++        iteration proportional to max(Q-V,0) + c_puct/sqrt(N)*prior instead of taking the
++        PUCT argmax. See RootPolicy in mcts.rs for the exact formula and rationale.
++    :type root_regret_matching: bool
+     :return: the result of the search
+     :rtype: MctsResult
+     """
+-    return MctsResult._from_rust(mcts(state, duration_ms, iterations, threads))
++    return MctsResult._from_rust(
++        mcts(
++            state,
++            duration_ms,
++            iterations,
++            threads,
++            side_one_prior=side_one_prior,
++            side_two_prior=side_two_prior,
++            root_c_puct=root_c_puct,
++            root_regret_matching=root_regret_matching,
++        )
++    )
+ 
+ 
+ def iterative_deepening_expectiminimax(
+diff -ruN a/poke-engine-py/src/lib.rs b/poke-engine-py/src/lib.rs
+--- a/poke-engine-py/src/lib.rs	2026-09-17 04:42:04.904221268 +0000
++++ b/poke-engine-py/src/lib.rs	2026-09-17 04:42:04.909116174 +0000
+@@ -1,7 +1,7 @@
+ use pyo3::prelude::*;
+ use pyo3::types::PyType;
+ use pyo3::{pyfunction, pymethods, pymodule, wrap_pyfunction, Bound, PyResult};
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ 
+ use poke_engine::choices::{Choices, MoveCategory, MOVES};
+ use poke_engine::engine::abilities::Abilities;
+@@ -11,8 +11,8 @@
+ use poke_engine::engine::items::Items;
+ use poke_engine::engine::state::{MoveChoice, PokemonVolatileStatus, Terrain, Weather};
+ use poke_engine::instruction::{Instruction, StateInstructions};
+-use poke_engine::mcts::{perform_mcts, MctsResult, MctsSideResult};
+-use poke_engine::mcts_threaded::perform_mcts_shared_tree;
++use poke_engine::mcts::{perform_mcts_with_prior, MctsResult, MctsSideResult, RootPolicy};
++use poke_engine::mcts_threaded::perform_mcts_shared_tree_with_prior;
+ use poke_engine::pokemon::PokemonName;
+ use poke_engine::search::iterative_deepen_expectiminimax;
+ use poke_engine::state::{
+@@ -926,12 +926,52 @@
+     }
+ }
+ 
++/// Turn a `{move_choice_string: prior_probability}` dict from Python into a `Vec<f32>`
++/// aligned to `options`' index order (the order `root_get_all_options()` produced this call
++/// -- the caller cannot know this order ahead of time, which is why the Python-side API
++/// takes a dict keyed by the same move_choice strings `EnginePlayer` already uses everywhere
++/// else, e.g. `laplace.policy.action_space`, rather than a positional list). Missing keys
++/// fall back to uniform inside `populate_with_prior`/`SharedNodeOptions::new_with_prior`
++/// (via `prior_at`), so a policy net that only scored some of this turn's options (e.g. it
++/// was trained before a newly-legal Tera variant existed) still produces a valid, if partly
++/// uniform, prior rather than an error.
++fn prior_vec_from_dict(
++    side: &Side,
++    options: &[MoveChoice],
++    prior: &Option<HashMap<String, f32>>,
++) -> Option<Vec<f32>> {
++    let prior = prior.as_ref()?;
++    Some(
++        options
++            .iter()
++            .map(|c| {
++                let key = movechoice_to_string(side, c);
++                prior.get(&key).copied().unwrap_or(1.0 / options.len().max(1) as f32)
++            })
++            .collect(),
++    )
++}
++
+ #[pyfunction]
++#[pyo3(signature = (
++    py_state,
++    duration_ms,
++    iterations,
++    threads,
++    side_one_prior=None,
++    side_two_prior=None,
++    root_c_puct=0.0,
++    root_regret_matching=false,
++))]
+ fn mcts(
+     py_state: PyState,
+     duration_ms: u64,
+     mut iterations: u32,
+     threads: usize,
++    side_one_prior: Option<HashMap<String, f32>>,
++    side_two_prior: Option<HashMap<String, f32>>,
++    root_c_puct: f32,
++    root_regret_matching: bool,
+ ) -> PyResult<PyMctsResult> {
+     let mut state: State = py_state.into();
+     let duration = Duration::from_millis(duration_ms);
+@@ -939,12 +979,33 @@
+     if s1_options.len() <= 1 {
+         iterations = 100; // if there's only one option, force a quick exit
+     }
++
++    // `side_one_prior`: a Phase-1 policy net scoring OUR OWN legal actions (laplace's
++    // `EnginePlayer` is always side one against poke-engine) -- safe by construction, since
++    // it's built from information we actually have.
++    //
++    // `side_two_prior`: added for Phase 4 (opponent modelling), but the engine has NO way to
++    // verify what a caller built this from. THIS IS ON THE CALLER: `side_two_prior` must be
++    // computed from information actually revealed to the real opponent (their own
++    // known/used moves, public field state, etc.), never from the specific hidden world this
++    // determinized `state` happens to have sampled -- see Phase 5 in the project's plan.
++    // Passing a prior derived from our sampled hidden set here silently reintroduces the
++    // exact leak this parameter's sibling was designed to avoid; the engine has no way to
++    // catch that mistake for you.
++    let s1_prior = prior_vec_from_dict(&state.side_one, &s1_options, &side_one_prior);
++    let s2_prior = prior_vec_from_dict(&state.side_two, &s2_options, &side_two_prior);
++    let root_policy = RootPolicy { c_puct: root_c_puct, regret_matching: root_regret_matching };
++
+     let mcts_result = if threads > 1 {
+-        perform_mcts_shared_tree(
++        perform_mcts_shared_tree_with_prior(
+             &mut state, s1_options, s2_options, duration, iterations, threads,
++            s1_prior, s2_prior, root_policy,
+         )
+     } else {
+-        perform_mcts(&mut state, s1_options, s2_options, duration, iterations)
++        perform_mcts_with_prior(
++            &mut state, s1_options, s2_options, duration, iterations,
++            s1_prior, s2_prior, root_policy,
++        )
+     };
+ 
+     let py_mcts_result = PyMctsResult::from_mcts_result(mcts_result, &state);
+diff -ruN a/src/mcts.rs b/src/mcts.rs
+--- a/src/mcts.rs	2026-09-17 04:42:04.905536474 +0000
++++ b/src/mcts.rs	2026-09-17 04:42:04.911689796 +0000
+@@ -13,6 +13,34 @@
+     1.0 / (1.0 + (-0.0125 * x).exp())
+ }
+ 
++/// Root-only learned-prior configuration (Jaxcalibur-inspired Phase 1/6).
++///
++/// poke-engine's tree otherwise has no way to hear from an external policy net: nodes below
++/// the root are hypothetical futures nobody has featurized, so there is nothing not-uniform
++/// to hand them. The root is the one place a caller (laplace's `EnginePlayer`) has already
++/// built full board features for, so that is the only place this engine accepts a prior.
++///
++/// Defaulting `c_puct` to 0.0 (see `RootPolicy::disabled`) makes every formula below reduce
++/// to plain UCB1 -- existing callers that don't pass a prior get byte-identical search
++/// behaviour to before this file changed.
++#[derive(Clone, Copy, Debug)]
++pub struct RootPolicy {
++    /// 0.0 disables the prior/regret-matching path entirely (falls back to argmax UCB1).
++    pub c_puct: f32,
++    /// Sample the root's move stochastically each iteration (regret-matching-style), rather
++    /// than the fixed argmax UCB1 selection every non-root node still uses.
++    pub regret_matching: bool,
++}
++
++impl RootPolicy {
++    pub fn disabled() -> Self {
++        RootPolicy { c_puct: 0.0, regret_matching: false }
++    }
++    pub fn active(&self) -> bool {
++        self.c_puct > 0.0
++    }
++}
++
+ #[derive(Debug)]
+ pub struct Node {
+     pub root: bool,
+@@ -28,6 +56,11 @@
+     // de-coupled for s1 and s2
+     pub s1_options: Option<Vec<MoveNode>>,
+     pub s2_options: Option<Vec<MoveNode>>,
++
++    // Only ever non-default on the root (see `RootPolicy`). Kept as a plain `Copy` field
++    // rather than a reference so `Node` doesn't need a lifetime parameter threaded through
++    // every existing call site.
++    root_policy: RootPolicy,
+ }
+ 
+ impl Node {
+@@ -41,23 +74,51 @@
+             s2_choice: 0,
+             s1_options: None,
+             s2_options: None,
++            root_policy: RootPolicy::disabled(),
+         }
+     }
++
+     unsafe fn populate(&mut self, s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) {
++        self.populate_with_prior(s1_options, s2_options, None, None)
++    }
++
++    /// Same as `populate`, but attaches a per-option prior probability (Jaxcalibur-style
++    /// policy-net output) when one is supplied. `s1_prior`/`s2_prior` must be the same
++    /// length as their option list and are matched by INDEX (not by move name) -- the caller
++    /// (poke-engine-py's `mcts()`) is responsible for building that vector in the same order
++    /// `state.root_get_all_options()` returns, since that's the only ordering available
++    /// before this function runs. A missing or wrong-length prior degrades to uniform,
++    /// never to a panic or a silently-misaligned prior.
++    unsafe fn populate_with_prior(
++        &mut self,
++        s1_options: Vec<MoveChoice>,
++        s2_options: Vec<MoveChoice>,
++        s1_prior: Option<&[f32]>,
++        s2_prior: Option<&[f32]>,
++    ) {
++        let n1 = s1_options.len().max(1);
++        let n2 = s2_options.len().max(1);
++        let uniform1 = 1.0 / n1 as f32;
++        let uniform2 = 1.0 / n2 as f32;
++
+         let s1_options_vec: Vec<MoveNode> = s1_options
+             .iter()
+-            .map(|x| MoveNode {
++            .enumerate()
++            .map(|(i, x)| MoveNode {
+                 move_choice: x.clone(),
+                 total_score: 0.0,
+                 visits: 0,
++                prior: prior_at(s1_prior, i, uniform1),
+             })
+             .collect();
+         let s2_options_vec: Vec<MoveNode> = s2_options
+             .iter()
+-            .map(|x| MoveNode {
++            .enumerate()
++            .map(|(i, x)| MoveNode {
+                 move_choice: x.clone(),
+                 total_score: 0.0,
+                 visits: 0,
++                prior: prior_at(s2_prior, i, uniform2),
+             })
+             .collect();
+ 
+@@ -65,7 +126,25 @@
+         self.s2_options = Some(s2_options_vec);
+     }
+ 
+-    pub fn maximize_ucb_for_side(&self, side_map: &[MoveNode]) -> usize {
++    /// Root value estimate used by the regret-matching formula: the pooled average score
++    /// across a side's options so far, i.e. an empirical V(root) for that side. Before any
++    /// visits exist this is undefined, so callers treat 0 visits as "no regret signal yet"
++    /// and fall back to the plain prior/exploration term (see `MoveNode::regret_matching`).
++    fn side_value(side_map: &[MoveNode]) -> (f32, u32) {
++        let (total_score, total_visits) = side_map
++            .iter()
++            .fold((0.0f32, 0u32), |(ts, tv), n| (ts + n.total_score, tv + n.visits));
++        if total_visits == 0 {
++            (0.0, 0)
++        } else {
++            (total_score / total_visits as f32, total_visits)
++        }
++    }
++
++    pub fn maximize_ucb_for_side(&self, side_map: &[MoveNode], rng: &mut impl Rng) -> usize {
++        if self.root && self.root_policy.active() {
++            return self.select_root_side(side_map, rng);
++        }
+         let mut choice = 0;
+         let mut best_ucb1 = f32::MIN;
+         for (index, node) in side_map.iter().enumerate() {
+@@ -78,6 +157,63 @@
+         choice
+     }
+ 
++    /// Root-only selection. Two modes, both gated on `self.root_policy.active()`
++    /// (c_puct > 0), so this method is never reached unless a caller opted in:
++    ///
++    ///   * `regret_matching = false` (default when a prior is supplied): PUCT, i.e. the
++    ///     existing UCB1 argmax with the exploration term additionally weighted by the
++    ///     learned prior: `Q + c_puct * P(a) * sqrt(N) / (1 + n)`. Still deterministic
++    ///     argmax, so this is the lower-risk of the two -- it only ever biases which action
++    ///     UCB1 was already going to favour, it can't introduce new variance in which
++    ///     action gets chosen for a given visit-count profile.
++    ///   * `regret_matching = true`: samples the root move each iteration proportional to
++    ///     `max(Q(a) - V, 0) + (c_puct / sqrt(N)) * P(a)`, per Jaxcalibur's write-up
++    ///     ("Architecture" -> "Search"). This is the more faithful reproduction of the
++    ///     described mechanism but changes the qualitative behaviour of root visit
++    ///     accumulation (a mixed strategy instead of an optimism-driven argmax), so it is
++    ///     opt-in and should be A/B'd against the PUCT mode, not assumed better.
++    fn select_root_side(&self, side_map: &[MoveNode], rng: &mut impl Rng) -> usize {
++        let n = side_map.len();
++        if n == 0 {
++            return 0;
++        }
++        let parent_visits = self.times_visited.max(1);
++
++        if !self.root_policy.regret_matching {
++            let mut choice = 0;
++            let mut best = f32::MIN;
++            for (i, node) in side_map.iter().enumerate() {
++                let score = node.puct(parent_visits, self.root_policy.c_puct);
++                if score > best {
++                    best = score;
++                    choice = i;
++                }
++            }
++            return choice;
++        }
++
++        let (value, visits) = Self::side_value(side_map);
++        let weights: Vec<f32> = side_map
++            .iter()
++            .map(|node| node.regret_matching_weight(value, visits, self.root_policy.c_puct))
++            .collect();
++        let total: f32 = weights.iter().sum();
++        if total <= 0.0 {
++            // No regret signal yet (first visits) and a degenerate prior: fall back to
++            // uniform random rather than always picking index 0, so early exploration still
++            // covers every option.
++            return rng.random_range(0..n);
++        }
++        let mut threshold = rng.random_range(0.0..total);
++        for (i, w) in weights.iter().enumerate() {
++            threshold -= w;
++            if threshold <= 0.0 {
++                return i;
++            }
++        }
++        n - 1
++    }
++
+     pub unsafe fn selection(
+         &mut self,
+         state: &mut State,
+@@ -89,8 +225,8 @@
+             self.populate(s1_options, s2_options);
+         }
+ 
+-        let s1_mc_index = self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap());
+-        let s2_mc_index = self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap());
++        let s1_mc_index = self.maximize_ucb_for_side(self.s1_options.as_ref().unwrap(), rng);
++        let s2_mc_index = self.maximize_ucb_for_side(self.s2_options.as_ref().unwrap(), rng);
+         let key = (self as *mut Node as usize, s1_mc_index, s2_mc_index);
+         match children.get_mut(&key) {
+             Some(child_vector) => {
+@@ -207,6 +343,22 @@
+     pub move_choice: MoveChoice,
+     pub total_score: f32,
+     pub visits: u32,
++    /// Learned-prior probability for this option, in [0, 1]. 1/n (uniform) unless a caller
++    /// supplied a real prior for the root -- see `Node::populate_with_prior`.
++    pub prior: f32,
++}
++
++/// Shared by both prior-consuming paths: index into an optional prior slice, defaulting to
++/// `fallback` (uniform) when absent or short. Never panics on a mismatched-length prior --
++/// see `populate_with_prior`'s doc comment for why that has to be true (the prior comes from
++/// a separate Python-side computation of "same order as root_get_all_options()", which is
++/// trusted but not verified, and a length mismatch should degrade gracefully, not crash the
++/// ladder mid-battle).
++fn prior_at(prior: Option<&[f32]>, i: usize, fallback: f32) -> f32 {
++    match prior {
++        Some(p) if i < p.len() && p[i].is_finite() && p[i] >= 0.0 => p[i],
++        _ => fallback,
++    }
+ }
+ 
+ impl MoveNode {
+@@ -218,12 +370,47 @@
+             + (2.0 * (parent_visits as f32).ln() / self.visits as f32).sqrt();
+         score
+     }
++
++    /// AlphaZero-style PUCT: same exploitation term as `ucb1`, but the exploration term is
++    /// scaled by this option's prior instead of being prior-free. `c_puct` plays the same
++    /// role as AlphaZero's constant of the same name. Falls back to `f32::INFINITY` for an
++    /// unvisited option exactly like `ucb1` does, so every option is still tried at least
++    /// once regardless of how small its prior is -- a confident-but-wrong prior can bias
++    /// *order* of exploration, never fully starve an option of its first visit.
++    pub fn puct(&self, parent_visits: u32, c_puct: f32) -> f32 {
++        if self.visits == 0 {
++            return f32::INFINITY;
++        }
++        let q = self.total_score / self.visits as f32;
++        let exploration = c_puct * self.prior.max(1e-6) * (parent_visits as f32).sqrt()
++            / (1.0 + self.visits as f32);
++        q + exploration
++    }
++
+     pub fn average_score(&self) -> f32 {
+-        let score = self.total_score / self.visits as f32;
+-        score
++        if self.visits == 0 {
++            return 0.0;
++        }
++        self.total_score / self.visits as f32
++    }
++
++    /// `max(Q(a) - V, 0) + (c_puct / sqrt(N)) * P(a)`, the regret-matching-flavoured root
++    /// sampling weight. `root_value`/`root_visits` come from `Node::side_value` (the
++    /// pooled/empirical V for this side); `root_visits == 0` means nothing has been sampled
++    /// yet, in which case regret is undefined and this returns just the prior term so the
++    /// very first iterations are prior-guided rather than zero-weighted.
++    pub fn regret_matching_weight(&self, root_value: f32, root_visits: u32, c_puct: f32) -> f32 {
++        let regret = if root_visits == 0 {
++            0.0
++        } else {
++            (self.average_score() - root_value).max(0.0)
++        };
++        let n = (root_visits.max(1) as f32).sqrt();
++        regret + (c_puct / n) * self.prior.max(1e-6)
+     }
+ }
+ 
++
+ #[derive(Clone)]
+ pub struct MctsSideResult {
+     pub move_choice: MoveChoice,
+@@ -303,11 +490,43 @@
+     max_time: Duration,
+     max_iterations: u32,
+ ) -> MctsResult {
++    perform_mcts_with_prior(
++        state,
++        side_one_options,
++        side_two_options,
++        max_time,
++        max_iterations,
++        None,
++        None,
++        RootPolicy::disabled(),
++    )
++}
++
++/// Same as `perform_mcts`, with an optional learned prior over each side's root options and
++/// a `RootPolicy` controlling how it's used (see `RootPolicy`, `MoveNode::puct`,
++/// `MoveNode::regret_matching_weight`). `perform_mcts` above is unchanged and calls straight
++/// through to this with priors disabled, so existing callers keep today's exact behaviour.
++pub fn perform_mcts_with_prior(
++    state: &mut State,
++    side_one_options: Vec<MoveChoice>,
++    side_two_options: Vec<MoveChoice>,
++    max_time: Duration,
++    max_iterations: u32,
++    side_one_prior: Option<Vec<f32>>,
++    side_two_prior: Option<Vec<f32>>,
++    root_policy: RootPolicy,
++) -> MctsResult {
+     let mut root_node = Node::new();
+     unsafe {
+-        root_node.populate(side_one_options, side_two_options);
++        root_node.populate_with_prior(
++            side_one_options,
++            side_two_options,
++            side_one_prior.as_deref(),
++            side_two_prior.as_deref(),
++        );
+     }
+     root_node.root = true;
++    root_node.root_policy = root_policy;
+     let mut children: HashMap<(usize, usize, usize), Box<[Node]>> = HashMap::new();
+ 
+     let root_eval = evaluate(state);
+@@ -352,3 +571,4 @@
+ 
+     result
+ }
++
+diff -ruN a/src/mcts_threaded.rs b/src/mcts_threaded.rs
+--- a/src/mcts_threaded.rs	2026-09-17 04:42:04.905550128 +0000
++++ b/src/mcts_threaded.rs	2026-09-17 04:42:04.910664126 +0000
+@@ -2,7 +2,7 @@
+ use crate::engine::generate_instructions::generate_instructions_from_move_pair;
+ use crate::engine::state::MoveChoice;
+ use crate::instruction::StateInstructions;
+-use crate::mcts::{MctsResult, MctsSideResult};
++use crate::mcts::{MctsResult, MctsSideResult, RootPolicy};
+ use crate::state::State;
+ use dashmap::DashMap;
+ use rand::prelude::*;
+@@ -27,18 +27,31 @@
+     1.0 / (1.0 + (-0.0125 * x).exp())
+ }
+ 
++fn prior_at(prior: Option<&[f32]>, i: usize, fallback: f32) -> f32 {
++    match prior {
++        Some(p) if i < p.len() && p[i].is_finite() && p[i] >= 0.0 => p[i],
++        _ => fallback,
++    }
++}
++
+ pub struct MoveNode {
+     move_choice: MoveChoice,
+     total_score: AtomicU32,
+     visits: AtomicU32,
++    /// Set once at node construction, never mutated afterwards -- a plain f32 needs no
++    /// atomic wrapper. See `mcts::MoveNode::prior` for the single-threaded twin of this
++    /// field; kept in sync by hand since the two search implementations don't share a Node
++    /// type (a pre-existing duplication in this crate, not introduced by this patch).
++    prior: f32,
+ }
+ 
+ impl MoveNode {
+-    fn new(move_choice: MoveChoice) -> Self {
++    fn new(move_choice: MoveChoice, prior: f32) -> Self {
+         Self {
+             move_choice,
+             total_score: AtomicU32::new(0),
+             visits: AtomicU32::new(0),
++            prior,
+         }
+     }
+ 
+@@ -60,6 +73,19 @@
+         self.total_score.load(Ordering::Acquire) as f32 / SCORE_SCALE
+     }
+ 
++    fn visits_u32(&self) -> u32 {
++        self.visits.load(Ordering::Acquire)
++    }
++
++    fn average_score(&self) -> f32 {
++        let visits = self.visits_u32();
++        if visits == 0 {
++            0.0
++        } else {
++            self.total_score_f32() / visits as f32
++        }
++    }
++
+     fn ucb1(&self, parent_visits: u32) -> f32 {
+         let visits = self.visits.load(Ordering::Acquire);
+         if visits == 0 {
+@@ -69,6 +95,29 @@
+         let exploration = 2.0 * (parent_visits as f32).ln().max(0.0) / visits as f32;
+         average_score + exploration.sqrt()
+     }
++
++    /// See `mcts::MoveNode::puct` -- identical formula, atomic-backed reads.
++    fn puct(&self, parent_visits: u32, c_puct: f32) -> f32 {
++        let visits = self.visits_u32();
++        if visits == 0 {
++            return f32::INFINITY;
++        }
++        let q = self.total_score_f32() / visits as f32;
++        let exploration =
++            c_puct * self.prior.max(1e-6) * (parent_visits as f32).sqrt() / (1.0 + visits as f32);
++        q + exploration
++    }
++
++    /// See `mcts::MoveNode::regret_matching_weight`.
++    fn regret_matching_weight(&self, root_value: f32, root_visits: u32, c_puct: f32) -> f32 {
++        let regret = if root_visits == 0 {
++            0.0
++        } else {
++            (self.average_score() - root_value).max(0.0)
++        };
++        let n = (root_visits.max(1) as f32).sqrt();
++        regret + (c_puct / n) * self.prior.max(1e-6)
++    }
+ }
+ 
+ pub struct SharedNodeOptions {
+@@ -78,13 +127,35 @@
+ 
+ impl SharedNodeOptions {
+     fn new(s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) -> Self {
++        Self::new_with_prior(s1_options, s2_options, None, None)
++    }
++
++    fn new_with_prior(
++        s1_options: Vec<MoveChoice>,
++        s2_options: Vec<MoveChoice>,
++        s1_prior: Option<&[f32]>,
++        s2_prior: Option<&[f32]>,
++    ) -> Self {
++        let n1 = s1_options.len().max(1);
++        let n2 = s2_options.len().max(1);
++        let u1 = 1.0 / n1 as f32;
++        let u2 = 1.0 / n2 as f32;
+         Self {
+-            s1: s1_options.into_iter().map(MoveNode::new).collect(),
+-            s2: s2_options.into_iter().map(MoveNode::new).collect(),
++            s1: s1_options
++                .into_iter()
++                .enumerate()
++                .map(|(i, mc)| MoveNode::new(mc, prior_at(s1_prior, i, u1)))
++                .collect(),
++            s2: s2_options
++                .into_iter()
++                .enumerate()
++                .map(|(i, mc)| MoveNode::new(mc, prior_at(s2_prior, i, u2)))
++                .collect(),
+         }
+     }
+ }
+ 
++
+ pub struct SharedBranch {
+     nodes: Arc<[Node]>,
+     total_weight: f32,
+@@ -120,10 +191,24 @@
+     times_visited: AtomicU32,
+     virtual_losses: AtomicI8,
+     options: OnceLock<SharedNodeOptions>,
++    /// See `mcts::RootPolicy`. Always `RootPolicy::disabled()` except on the root node --
++    /// `select_move_pair` only consults it when `self.root` is true.
++    root_policy: RootPolicy,
+ }
+ 
+ impl Node {
++    #[allow(dead_code)] // kept as a documented, zero-prior entry point for any future direct caller
+     fn new_root(s1_options: Vec<MoveChoice>, s2_options: Vec<MoveChoice>) -> Arc<Self> {
++        Self::new_root_with_prior(s1_options, s2_options, None, None, RootPolicy::disabled())
++    }
++
++    fn new_root_with_prior(
++        s1_options: Vec<MoveChoice>,
++        s2_options: Vec<MoveChoice>,
++        s1_prior: Option<&[f32]>,
++        s2_prior: Option<&[f32]>,
++        root_policy: RootPolicy,
++    ) -> Arc<Self> {
+         let node = Arc::new(Self {
+             root: true,
+             instructions: StateInstructions::default(),
+@@ -131,10 +216,11 @@
+             times_visited: AtomicU32::new(0),
+             virtual_losses: AtomicI8::new(0),
+             options: OnceLock::new(),
++            root_policy,
+         });
+-        let _ = node
+-            .options
+-            .set(SharedNodeOptions::new(s1_options, s2_options));
++        let _ = node.options.set(SharedNodeOptions::new_with_prior(
++            s1_options, s2_options, s1_prior, s2_prior,
++        ));
+         node
+     }
+ 
+@@ -146,6 +232,7 @@
+             times_visited: AtomicU32::new(0),
+             virtual_losses: AtomicI8::new(0),
+             options: OnceLock::new(),
++            root_policy: RootPolicy::disabled(),
+         }
+     }
+ 
+@@ -160,7 +247,7 @@
+         })
+     }
+ 
+-    fn select_move_pair(&self, state: &State) -> (usize, usize) {
++    fn select_move_pair<R: Rng + ?Sized>(&self, state: &State, rng: &mut R) -> (usize, usize) {
+         let options = self.ensure_options(state);
+         let parent_visits = self
+             .times_visited
+@@ -168,8 +255,8 @@
+             .saturating_add(self.virtual_losses.load(Ordering::Acquire).max(0) as u32)
+             .max(1);
+         (
+-            self.maximize_ucb_for_side(&options.s1, parent_visits),
+-            self.maximize_ucb_for_side(&options.s2, parent_visits),
++            self.maximize_ucb_for_side(&options.s1, parent_visits, rng),
++            self.maximize_ucb_for_side(&options.s2, parent_visits, rng),
+         )
+     }
+ 
+@@ -187,7 +274,7 @@
+         let mut current: *const Node = Arc::as_ptr(root);
+         loop {
+             let node = unsafe { &*current };
+-            let (s1_index, s2_index) = node.select_move_pair(state);
++            let (s1_index, s2_index) = node.select_move_pair(state, rng);
+             let options = node.options.get().expect("options set during selection");
+ 
+             let key = (node.as_key(), s1_index, s2_index);
+@@ -222,7 +309,29 @@
+         }
+     }
+ 
+-    fn maximize_ucb_for_side(&self, side_options: &[MoveNode], parent_visits: u32) -> usize {
++    fn side_value(side_options: &[MoveNode]) -> (f32, u32) {
++        let mut total_score = 0.0f32;
++        let mut total_visits = 0u32;
++        for n in side_options {
++            total_score += n.total_score_f32();
++            total_visits += n.visits_u32();
++        }
++        if total_visits == 0 {
++            (0.0, 0)
++        } else {
++            (total_score / total_visits as f32, total_visits)
++        }
++    }
++
++    fn maximize_ucb_for_side<R: Rng + ?Sized>(
++        &self,
++        side_options: &[MoveNode],
++        parent_visits: u32,
++        rng: &mut R,
++    ) -> usize {
++        if self.root && self.root_policy.active() {
++            return self.select_root_side(side_options, parent_visits, rng);
++        }
+         side_options
+             .iter()
+             .enumerate()
+@@ -235,6 +344,50 @@
+             .unwrap_or(0)
+     }
+ 
++    /// See `mcts::Node::select_root_side` -- same two modes (PUCT argmax / regret-matching
++    /// sample), atomic-backed reads instead of the single-threaded plain fields.
++    fn select_root_side<R: Rng + ?Sized>(
++        &self,
++        side_options: &[MoveNode],
++        parent_visits: u32,
++        rng: &mut R,
++    ) -> usize {
++        let n = side_options.len();
++        if n == 0 {
++            return 0;
++        }
++        if !self.root_policy.regret_matching {
++            return side_options
++                .iter()
++                .enumerate()
++                .max_by(|(_, a), (_, b)| {
++                    a.puct(parent_visits, self.root_policy.c_puct)
++                        .partial_cmp(&b.puct(parent_visits, self.root_policy.c_puct))
++                        .unwrap_or(std::cmp::Ordering::Equal)
++                })
++                .map(|(i, _)| i)
++                .unwrap_or(0);
++        }
++
++        let (value, visits) = Self::side_value(side_options);
++        let weights: Vec<f32> = side_options
++            .iter()
++            .map(|node| node.regret_matching_weight(value, visits, self.root_policy.c_puct))
++            .collect();
++        let total: f32 = weights.iter().sum();
++        if total <= 0.0 {
++            return rng.random_range(0..n);
++        }
++        let mut threshold = rng.random_range(0.0..total);
++        for (i, w) in weights.iter().enumerate() {
++            threshold -= w;
++            if threshold <= 0.0 {
++                return i;
++            }
++        }
++        n - 1
++    }
++
+     /// looks up or creates the child branch for `(s1_index, s2_index)` and
+     /// returns one sampled child, applying virtual loss bookkeeping.  Returns
+     /// `None` when the node should not be expanded (battle over, both-None).
+@@ -420,9 +573,43 @@
+     max_iterations: u32,
+     worker_count: usize,
+ ) -> MctsResult {
++    perform_mcts_shared_tree_with_prior(
++        state,
++        side_one_options,
++        side_two_options,
++        max_time,
++        max_iterations,
++        worker_count,
++        None,
++        None,
++        RootPolicy::disabled(),
++    )
++}
++
++/// Same as `perform_mcts_shared_tree`, with an optional learned prior over each side's root
++/// options -- see `mcts::perform_mcts_with_prior`, which this mirrors. This is the function
++/// Laplace's `EnginePlayer` actually reaches at `threads=8`, so it (not the single-threaded
++/// `mcts::perform_mcts_with_prior`) is the one that matters for the shipped ladder config.
++pub fn perform_mcts_shared_tree_with_prior(
++    state: &mut State,
++    side_one_options: Vec<MoveChoice>,
++    side_two_options: Vec<MoveChoice>,
++    max_time: Duration,
++    max_iterations: u32,
++    worker_count: usize,
++    side_one_prior: Option<Vec<f32>>,
++    side_two_prior: Option<Vec<f32>>,
++    root_policy: RootPolicy,
++) -> MctsResult {
+     let root_eval = evaluate(state);
+     let deadline = Instant::now() + max_time;
+-    let root = Node::new_root(side_one_options, side_two_options);
++    let root = Node::new_root_with_prior(
++        side_one_options,
++        side_two_options,
++        side_one_prior.as_deref(),
++        side_two_prior.as_deref(),
++        root_policy,
++    );
+     let started_iterations = Arc::new(AtomicU32::new(0));
+ 
+     // global map shared by all threads.
