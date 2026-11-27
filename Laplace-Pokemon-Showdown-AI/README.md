@@ -1,8 +1,28 @@
-# Laplace, a Pokémon Showdown battle AI
+<p align="center">
+  <img src="docs/assets/lapras.gif" alt="Animated pixel-art Lapras, the Laplace mascot" width="136" height="144">
+</p>
 
-Laplace plays [Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle. It peaked at
-**2231 Elo / ~83.3 GXE** on the live ladder, top 1% of ranked players and #135 in the world, well
-past the point where the opponents are strong humans rather than other bots. It garnered over 200k views on social media.
+# Laplace
+
+**A Pokémon Showdown bot that plays Gen 9 Random Battle using Monte Carlo tree search and a trained value network.**
+
+[![CI](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**[Watch the demo](https://www.trylaplaceai.com/#replays)** ·
+[Full battle replay](https://www.trylaplaceai.com/replays/won-battle-gen9randombattle-2644166378.html) ·
+[Quick start](#setup) · [Contribute](CONTRIBUTING.md) ·
+[Discussions](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/discussions)
+
+The website offers watchable replays; a hosted bot you can challenge is still in development.
+
+This is the **OU** development branch, containing the Gen 9 OU bot and its shared
+Random Battle engine. For the standalone Random Battle bot, use
+[`main`](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/tree/main).
+
+Laplace reached a historical peak of **2231 Elo / ~83.3 GXE** on the
+[Pokémon Showdown](https://pokemonshowdown.com/) Gen 9 Random Battle ladder.
+It received over **400k+ views** on social media. 
 
 The bot utilizes MCTS and a trained value net to rank actions. Every turn, it guesses the opponents' hidden stats (items, abilities, stats, etc) and guesses forward with a real Gen 9 engine, picking from the pooled result. 
 
@@ -30,7 +50,7 @@ structured, and you can weight your guesses by how the generator actually works.
 1. **Read the state.** [`poke-env`](https://github.com/hsahovic/poke-env) tracks what the server
    has revealed: moves, items, HP, boosts, hazards, weather, field conditions.
 
-2. **Fill in the unknowns.** The bot samples eight complete opponent teams with real items,
+2. **Fill in the unknowns.** The bot normally samples eight complete opponent teams with real items,
    abilities, moves and Tera types, drawn from Random Battle usage counts and filtered against
    everything seen so far. The filter is the interesting part: it folds in revealed moves, Choice
    locks inferred from move history, and Choice Scarf verdicts read off turn order (Random Battle
@@ -39,7 +59,11 @@ structured, and you can weight your guesses by how the generator actually works.
 
 3. **Search each world.** Each sampled team goes to
    [`poke-engine`](https://github.com/pmariglia/poke-engine), a fast Rust Gen 9 engine running
-   MCTS at 150 ms per world, roughly 2M visits a turn in total. Damage, priority, hazards,
+   MCTS at 150 ms per world (600 ms with `--fork`). Worlds run in a persistent process pool,
+   using up to four workers and eight total engine threads, bounded by available CPUs.
+   With at most three opponents revealed and no moves known on the living active opponent,
+   it samples sixteen worlds for half as long. Traces record the actual budget, visits, and decision time;
+   playing strength under these settings still needs a fresh comparison. Damage, priority, hazards,
    residuals, abilities, turn order and Terastallization are modelled exactly, and MCTS handles
    the simultaneous-move turn properly where plain minimax would let the opponent peek at our move.
 
@@ -63,7 +87,7 @@ reproduced, traced to a specific flaw, and fixed with the smallest change that a
 no-op guard is a good example: the engine correctly predicted that a full-HP recovery move would
 do nothing, but its flat evaluation kept clicking it anyway.
 
-Nothing ships without a head-to-head test: new code vs old code, self-play on a local server, 60+
+Playing-strength changes need a head-to-head test: new code vs old code, self-play on a local server, 60+
 games, judged on a Wilson interval. This is the part that keeps the project honest, and plausible
 ideas failed it repeatedly. Feeding the search real item statistics without Choice-lock modelling
 *lost* at 39%. Adding search time did nothing, because the engine had already converged. Falsified
@@ -71,21 +95,40 @@ ideas are logged next to the ones that worked so a dead lever doesn't get retrie
 
 ## Setup
 
-Needs Python 3.12, Node.js 18+, git, and a Rust toolchain ([rustup](https://rustup.rs)) to build
-poke-engine. From the project root:
+Install **Python 3.12**, **Git**, and the stable **Rust toolchain**
+([rustup](https://rustup.rs)) first. Windows also needs the **Visual Studio C++ Build
+Tools** for Rust's linker. Clone this repository, then run one command from its root:
+
+```sh
+python scripts/setup.py
+```
+
+This creates `.venv`, installs the runtime dependencies and CPU PyTorch, builds
+`poke-engine==0.0.47` with Gen 9 Terastallization, clones Showdown for its set data,
+and runs the offline checks. It leaves existing credentials and checkouts intact.
+Linux and Windows are tested in CI; macOS is not yet CI-tested.
+
+Node.js is needed only for local battles and benchmarks. With Node.js 22+ installed,
+use `python scripts/setup.py --local-server` to also install the server dependencies.
+Training dependencies are optional: `.venv/Scripts/python -m pip install -e ".[train]"`
+(use `.venv/bin/python` on Linux/macOS).
+
+<details>
+<summary>Manual setup</summary>
 
 ```powershell
 # 1. Python environment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # prompt should show "(.venv)"
-pip install -r requirements.txt
+pip install -e .
 
 # 2. Local Showdown server (supplies the Random Battle data, and hosts local games)
 git clone --depth 1 https://github.com/smogon/pokemon-showdown.git server
+# For local battles only, with Node.js installed:
 cd server; npm install; cd ..
 
 # 3. poke-engine, built with the Gen 9 Terastallization feature
-pip install -v --force-reinstall --no-cache-dir "poke-engine==0.0.47" `
+pip install -v --force-reinstall --no-binary=poke-engine "poke-engine==0.0.47" `
   --config-settings="build-args=--features poke-engine/terastallization --no-default-features"
 
 # 4. The bot itself, editable so `laplace` imports from anywhere
@@ -96,8 +139,10 @@ pip install -e . --no-deps
 install points at `src/`, so edits take effect with no reinstall. A `ModuleNotFoundError` almost
 always means the venv isn't active.
 
-To play the real ladder, register a username at play.pokemonshowdown.com and put the credentials
-in a gitignored `.env` at the project root:
+</details>
+
+To play the real ladder, register a username at play.pokemonshowdown.com, copy
+`.env.example` to `.env`, and enter your credentials in that gitignored file:
 
 ```
 SHOWDOWN_USERNAME=YourBotName
@@ -107,6 +152,7 @@ SHOWDOWN_PASSWORD=your-password
 ## Running it
 
 The ladder connects to the official server, so it doesn't need the local one:
+On Linux/macOS, replace `.venv\Scripts\python.exe` below with `.venv/bin/python`.
 
 ```powershell
 .\.venv\Scripts\python.exe -u -m laplace.cli.ladder                # 10 ranked games
@@ -274,3 +320,20 @@ heuristic bot and the PPO experiments (see [`legacy/README.md`](legacy/README.md
 `server/` and `replays/` are generated, not committed. The install also puts
 `laplace-ladder`, `laplace-ou`, `laplace-fetch-ou`, `laplace-analyze`, `laplace-mine` and
 `laplace-train-value` on PATH.
+
+## Contributing
+
+Start with the [contributing guide](CONTRIBUTING.md) or a
+[good first issue](https://github.com/influxtion/Laplace-Pokemon-Showdown-AI/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+The offline checks run with `.venv/Scripts/python -m unittest discover -s tests -v`
+(use `.venv/bin/python` on Linux/macOS). No account is required.
+
+## License and credits
+
+Laplace's original code is [MIT licensed](LICENSE). See [CHANGELOG.md](CHANGELOG.md)
+for releases. Dependencies and third-party data retain their own licenses:
+[poke-env](https://github.com/hsahovic/poke-env),
+[poke-engine](https://github.com/pmariglia/poke-engine), and
+[Pokémon Showdown](https://github.com/smogon/pokemon-showdown).
+Pokémon names and related assets belong to their respective owners; this is an
+independent fan project.

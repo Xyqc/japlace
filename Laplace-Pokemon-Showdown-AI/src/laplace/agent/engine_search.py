@@ -5,9 +5,9 @@ guards consult, and the team-preview order all come from a `metagame` (see
 laplace.agent.metagame), which defaults to Gen 9 Random Battle.
 
 Per turn:
-  1. sample N_DETERMINIZATIONS concrete opponent teams consistent with what's revealed
+  1. allocate a world count and duration, then sample concrete opponent teams consistent with what's revealed
      (metagame.build_state),
-  2. MCTS each for SEARCH_TIME_MS,
+  2. MCTS each for the allocated duration, optionally in a bounded process pool,
   3. pool the root policies,
   4. run the guard/rerank pipeline over the pooled ranking,
   5. play the survivor.
@@ -27,6 +27,7 @@ instrumentation, nothing read back, so moves are identical with and without one
 attached. live_analysis.LiveAnalyzer is the shipped consumer.
 """
 
+import os
 import re
 import time
 from collections import namedtuple
@@ -40,7 +41,8 @@ from poke_env.data import to_id_str
 from poke_engine import monte_carlo_tree_search, generate_instructions
 
 from laplace.agent.knowledge import (estimate_damage_fraction, get_move, move_nullified,
-                                     priority_ability_possible, safe_priority)
+                                     priority_ability_possible, safe_priority, self_boosts,
+                                     RECOVERY_MOVES)
 from laplace.agent.metagame import RANDBATS
 from laplace.policy import history as _policy_history
 
@@ -58,6 +60,17 @@ def _spe_mult(boost):
 
 _Opt = namedtuple("_Opt", "move_choice visits")
 _Res = namedtuple("_Res", "side_one side_two total_visits")
+
+
+def search_cpu_layout():
+    """Bound ladder concurrency to available CPUs and the previous eight-thread budget."""
+    if hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    budget = max(1, min(cpus, 8))
+    workers = min(4, budget)
+    return workers, max(1, budget // workers)
 
 
 # Every move slot in a serialised State is "<ID>;<disabled>;<pp>". This blanks the pp field.
@@ -86,11 +99,8 @@ def _board_only(state_str):
 # weather/terrain-scaled one -- Synthesis, Moonlight, Morning Sun, Shore Up all come back
 # 0.0. Synthesis is the move that produced the 5-click full-HP loop this guard exists to
 # catch, so the id set is not optional. Union'd with mv.heal > 0 at the call site.
-_RECOVERY_MOVES = frozenset((
-    "recover", "roost", "softboiled", "slackoff", "milkdrink", "synthesis", "moonlight",
-    "morningsun", "shoreup", "strengthsap", "lifedew", "junglehealing", "healorder",
-    "rest", "swallow", "painsplit", "purify", "floralhealing",
-))
+# Canonical list lives in knowledge.py now -- team preview needs the same one.
+_RECOVERY_MOVES = RECOVERY_MOVES
 
 
 def _search_world(state_str, time_ms, threads, side_one_prior=None, side_two_prior=None,
@@ -158,6 +168,7 @@ class EnginePlayer(Player):
                  policy_model_path=None, policy_weight=0.35, use_opponent_prior=False,
                  tera_min_wins=1, parallel_worlds=False, use_joint_sets=True,
                  metagame=None,
+                 adaptive_search=False, search_workers=None,
                  mix_root=False, mix_frac=0.75, mix_collapse_eps=0.03, robust_vote=True,
                  absorb_guard=True, futility_guard=True, gamble_guard=False,
                  observer=None, **kwargs):
@@ -230,9 +241,11 @@ class EnginePlayer(Player):
         # 64% ungated. Humans tera aggressively and the mirror can't price the tempo lost
         # holding it in a tera race. Reverted to 1; knob kept for study at higher det counts.
         self.tera_min_wins = tera_min_wins
-        # Search all worlds concurrently in a process pool (see module top). Same wall
-        # clock buys N_DETERMINIZATIONS x the search.
+        # Search worlds through a persistent, bounded process pool (see module top).
         self.parallel_worlds = parallel_worlds
+        self.adaptive_search = adaptive_search
+        self.search_workers = search_workers or min(self.N_DETERMINIZATIONS, 12)
+        self._search_budget = None
         # Sample complete counted joint sets rather than composing from marginals.
         # Distributionally correct; came out of the compute-matched Foul Play diagnosis.
         self.use_joint_sets = use_joint_sets
@@ -258,6 +271,7 @@ class EnginePlayer(Player):
         self.futility_guard = futility_guard
         self.gamble_guard = gamble_guard
         self._vetoed = set()     # demoted by a guard this turn; never eligible for the mix
+        self._noop_kind = None   # which _noop_demote mode fired this turn, for the trace
         # robust_vote=False reverts to FP-style plain averaging of visit shares. Joint
         # sampling draws worlds by count, so the uniform average IS the likelihood-weighted
         # one. The robust vote was built when marginal sampling over-represented incoherent
@@ -311,8 +325,19 @@ class EnginePlayer(Player):
 
     def _pool(self):
         if self._executor is None:
-            self._executor = ProcessPoolExecutor(max_workers=min(self.N_DETERMINIZATIONS, 12))
+            self._executor = ProcessPoolExecutor(max_workers=self.search_workers)
         return self._executor
+
+    def _turn_search_budget(self, battle):
+        """Foul Play-style breadth/depth allocation, relative to our normal world count."""
+        worlds, time_ms = self.N_DETERMINIZATIONS, self.SEARCH_TIME_MS
+        if self.adaptive_search:
+            opp = battle.opponent_active_pokemon
+            if (len(battle.opponent_team) <= 3 and opp is not None
+                    and not opp.fainted and not opp.moves):
+                worlds *= 2
+                time_ms = max(1, time_ms // 2)
+        return worlds, time_ms
 
     def _load_value_model(self, path):
         import torch
@@ -761,8 +786,11 @@ class EnginePlayer(Player):
         speed_hints = self._opp_speed.get(battle.battle_tag, {})
         item_hints = self._opp_item.get(battle.battle_tag, {})
 
-        n = self.N_DETERMINIZATIONS
-        self._emit("search_start", worlds=n, time_ms=self.SEARCH_TIME_MS,
+        n, time_ms = self._turn_search_budget(battle)
+        self._search_budget = {"worlds": n, "time_ms": time_ms,
+                               "workers": self.search_workers if self.parallel_worlds else 1,
+                               "threads": self.THREADS}
+        self._emit("search_start", worlds=n, time_ms=time_ms,
                    threads=self.THREADS, parallel=self.parallel_worlds)
 
         searched = []            # (state, result) from whichever search path ran
@@ -792,7 +820,7 @@ class EnginePlayer(Player):
                         opp_prior = self._opponent_prior_dict(battle)
                     root_c_puct = self.policy_weight if (policy_prior or opp_prior) else 0.0
                     fut = self._pool().submit(_search_world, state.to_string(),
-                                              self.SEARCH_TIME_MS, self.THREADS,
+                                              time_ms, self.THREADS,
                                               policy_prior, opp_prior, root_c_puct)
                     jobs.append((state, fut))
                 except (KeyboardInterrupt, SystemExit):
@@ -803,7 +831,7 @@ class EnginePlayer(Player):
             for i, (state, fut) in enumerate(jobs):
                 t0 = time.perf_counter()
                 try:
-                    raw = fut.result(timeout=self.SEARCH_TIME_MS / 1000 * 4 + 10)
+                    raw = fut.result(timeout=time_ms / 1000 * 4 + 10)
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except BaseException:
@@ -833,7 +861,7 @@ class EnginePlayer(Player):
                         computed_prior = True
                     if opp_prior is None and self.use_opponent_prior:
                         opp_prior = self._opponent_prior_dict(battle)
-                    res = monte_carlo_tree_search(state, self.SEARCH_TIME_MS,
+                    res = monte_carlo_tree_search(state, time_ms,
                                                   threads=self.THREADS,
                                                   side_one_prior=policy_prior,
                                                   side_two_prior=opp_prior,
@@ -1206,7 +1234,11 @@ class EnginePlayer(Player):
             ranked = _stage("value", self._value_rerank(ranked, battle))
             if self.gamble_guard:
                 ranked = _stage("gamble", self._gamble_veto(battle, ranked))
-            ranked = _stage("noop", self._noop_demote(ranked))
+            # Two steps on purpose: _noop_demote sets self._noop_kind as a side effect and
+            # argument evaluation would read the stale value if this were one expression.
+            self._noop_kind = None
+            _noop_ranked = self._noop_demote(ranked)
+            ranked = _stage(self._noop_kind or "noop", _noop_ranked)
             ranked = _stage("deadlock", self._dead_lock_guard(battle, ranked))
             ranked, mixed = self._mix_sample(ranked)
 
@@ -1564,6 +1596,12 @@ class EnginePlayer(Player):
         moves = [c for c in winners if not c.startswith("switch ")]
         key = "noop_blanket" if moves and all(c in noops for c in moves) else "noop_selective"
         self.diag[key] = self.diag.get(key, 0) + 1
+        # Also surface it on the TRACE, not just the aggregate diag. These two modes are
+        # different rules wearing one name -- selective is the wasted-turn call the docstring
+        # describes, blanket is really "the modal reply is lethal, so switch" -- and a cohort
+        # that records both as "noop" cannot price them apart afterwards, which is exactly
+        # why the last mining pass could only report a single pooled rate.
+        self._noop_kind = key
         demoted = [c for c in winners if c not in keep]
         noops = set(demoted)
         self._vetoed |= noops
@@ -1734,9 +1772,11 @@ class EnginePlayer(Player):
                 # Anchors at least FUTILE_CHIP_RUN clicks back (run is most-recent-first).
                 anchors = [rec["opp_hp"] for rec in run[self.FUTILE_CHIP_RUN - 1:]]
                 return opp.current_hp_fraction >= min(anchors) - self.FUTILE_HP_EPS
-            boosts = dict(mv.boosts or {})
-            boosts.update(mv.self_boost or {})
-            if any(v > 0 for v in boosts.values()):
+            # self_boosts, not mv.boosts: Curse and Belly Drum report no boosts in the
+            # data, so a Curse loop used to fall straight past this branch into the
+            # recovery check and come back False -- the guard could not see the most
+            # common boost run on our own OU team.
+            if any(v > 0 for v in self_boosts(mv, me).values()):
                 my_now = sum(v for v in (me.boosts or {}).values() if v > 0)
                 return (len(run) >= self.FUTILE_BOOST_RUN
                         and my_now <= run[-1]["my_boosts"])
@@ -1963,7 +2003,9 @@ class EnginePlayer(Player):
         }
         if ms is not None:
             entry["ms"] = round(ms, 1)
-        # Total MCTS volume behind this decision. The per-turn BUDGET is fixed in
+        if self._search_budget is not None:
+            entry["search_budget"] = dict(self._search_budget)
+        # Total MCTS volume behind this decision. Each world's budget is in
         # milliseconds, so when the machine is loaded or thermally throttled the turn still
         # takes ~the same time while quietly buying fewer iterations -- measured +6.9% turn
         # time drift over one 4-hour run, with no record of the visits lost. Without this,
